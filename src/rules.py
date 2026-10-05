@@ -71,9 +71,6 @@ def _validate_incident(data, lookup):
         raise ValidationError("incident requires station_id, asset_id or link_id")
     if data.get("severity") not in ("low", "medium", "high", "critical"):
         raise ValidationError("invalid incident severity")
-    for item in _all(lookup, "incident"):
-        if item["status"] in ("open", "diagnosing", "recovery_planned", "recovering") and item["data"].get("asset_id") == data.get("asset_id") and item["data"].get("kind") == data.get("kind"):
-            raise ConflictError("active incident already exists for asset and kind")
 
 
 def _validate_action(data, lookup):
@@ -129,6 +126,35 @@ def _complete_action(actor, entity, data, lookup):
     if not data.get("outcome"):
         raise ValidationError("outcome is required")
     return {"completed_by": actor.user_id}
+
+
+def _close_incident(actor, entity, data, lookup):
+    """Snapshot the telemetry revision the closure is based on.
+
+    The closure basis ties the closed conclusion to a specific telemetry
+    revision. When a later telemetry revision advances past it, the service
+    reopens the incident for re-confirmation instead of leaving the stale
+    conclusion in effect.
+    """
+    asset_id = entity["data"].get("asset_id")
+    revisions = {}
+    max_revision = None
+    if asset_id:
+        for item in _all(lookup, "telemetry"):
+            if item["data"].get("asset_id") != asset_id:
+                continue
+            try:
+                revision = int(item["data"].get("revision", 0))
+            except (TypeError, ValueError):
+                continue
+            metric = item["data"].get("metric")
+            revisions[metric] = revision
+            if max_revision is None or revision > max_revision:
+                max_revision = revision
+    return {
+        "closed_by": actor.user_id,
+        "closure_basis": {"telemetry_revision": max_revision, "telemetry_revisions": revisions},
+    }
 
 
 def _complete_mission(actor, entity, data, lookup):
@@ -268,6 +294,7 @@ class RuleEngine:
     CUSTOM_TRANSITIONS = {
         ("telemetry", "revise"): _revise_telemetry,
         ("incident", "resolve"): _resolve_incident,
+        ("incident", "close"): _close_incident,
         ("recovery_action", "succeed"): _complete_action,
         ("mission", "complete"): _complete_mission,
     }
