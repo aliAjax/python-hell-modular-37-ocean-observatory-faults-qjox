@@ -111,7 +111,8 @@ def create_handler(service, rules, static_dir):
                         raise ValidationError("action is required")
                     data = body.pop("data", body)
                     expected = body.pop("expected_version", None)
-                    return self._send(200, service.transition(actor, parts[2], action, data, expected))
+                    idem = self.headers.get("Idempotency-Key")
+                    return self._send(200, service.transition(actor, parts[2], action, data, expected, idem))
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
                     body = self._body()
                     action = body.pop("action", None)
@@ -125,14 +126,16 @@ def create_handler(service, rules, static_dir):
                             action,
                             body.pop("data", body),
                             body.pop("expected_version", None),
+                            self.headers.get("Idempotency-Key"),
                         ),
                     )
                 if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":
-                    return self._send(200, service.transition(actor, parts[2], parts[3], self._body(), None))
+                    return self._send(200, service.transition(actor, parts[2], parts[3], self._body(), None, self.headers.get("Idempotency-Key")))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")
-                    return self._send(201, service.create(actor, parts[1], body, idem))
+                    result = service.create(actor, parts[1], body, idem)
+                    return self._send(200 if result.get("deduplicated") else 201, result)
                 raise NotFoundError("not found")
             except Exception as exc:
                 self._fail(exc)

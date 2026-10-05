@@ -1,6 +1,21 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+# 处于这些状态的事件占用 (资产范围, 故障类型) 活动槽位，同一时刻只允许一个。
+ACTIVE_INCIDENT_STATUSES = ("open", "diagnosing", "recovery_planned", "recovering", "reconfirm")
+
+# 已收口（resolved/closed）的事件可能被迟到的遥测修订推翻。
+CONCLUDED_INCIDENT_STATUSES = ("resolved", "closed")
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def incident_scope(data):
+    """事件去重范围：优先资产，其次站点，最后链路。"""
+    return data.get("asset_id") or data.get("station_id") or data.get("link_id")
 
 
 def _require(data, fields):
@@ -71,9 +86,8 @@ def _validate_incident(data, lookup):
         raise ValidationError("incident requires station_id, asset_id or link_id")
     if data.get("severity") not in ("low", "medium", "high", "critical"):
         raise ValidationError("invalid incident severity")
-    for item in _all(lookup, "incident"):
-        if item["status"] in ("open", "diagnosing", "recovery_planned", "recovering") and item["data"].get("asset_id") == data.get("asset_id") and item["data"].get("kind") == data.get("kind"):
-            raise ConflictError("active incident already exists for asset and kind")
+    # 同一范围同一故障类型的去重由服务层和 incident_active 唯一键保证：
+    # 后到的提交拿到活动事件编号而不是冲突错误。
 
 
 def _validate_action(data, lookup):
@@ -112,6 +126,16 @@ def _revise_telemetry(actor, entity, data, lookup):
     return {"late_revision": True, "revised_by": actor.user_id}
 
 
+def _closure_basis(lookup, asset_id):
+    """收口依据：受影响资产当前各指标的最高遥测修订号。"""
+    revision = 0
+    if asset_id:
+        for item in _all(lookup, "telemetry"):
+            if item["data"].get("asset_id") == asset_id:
+                revision = max(revision, int(item["data"].get("revision", 0) or 0))
+    return {"asset_id": asset_id, "telemetry_revision": revision, "recorded_at": utcnow()}
+
+
 def _resolve_incident(actor, entity, data, lookup):
     actions = [a for a in _all(lookup, "recovery_action") if a["data"].get("incident_id") == entity["id"] and a["status"] not in ("succeeded", "failed", "cancelled")]
     if actions:
@@ -122,7 +146,13 @@ def _resolve_incident(actor, entity, data, lookup):
     assets = [a for a in _all(lookup, "asset") if a["status"] in ("faulty", "offline", "rebooting")]
     if entity["data"].get("asset_id") and any(a["id"] == entity["data"].get("asset_id") for a in assets):
         raise ConflictError("affected asset is still unavailable")
-    return {"resolved_by": actor.user_id}
+    return {
+        "resolved_by": actor.user_id,
+        "closure_basis": _closure_basis(lookup, entity["data"].get("asset_id")),
+        "closure_valid": True,
+        "invalidated_by": None,
+        "invalidated_at": None,
+    }
 
 
 def _complete_action(actor, entity, data, lookup):
@@ -137,9 +167,25 @@ def _complete_mission(actor, entity, data, lookup):
     return {"completed_by": actor.user_id}
 
 
+def incidents_invalidated_by(lookup, asset_id, revision):
+    """找出被新遥测修订推翻的已收口事件，返回 (事件, 原依据修订号) 列表。"""
+    if not asset_id:
+        return []
+    invalidated = []
+    for item in _all(lookup, "incident"):
+        if item["status"] not in CONCLUDED_INCIDENT_STATUSES:
+            continue
+        if item["data"].get("asset_id") != asset_id:
+            continue
+        basis = item["data"].get("closure_basis") or {}
+        basis_revision = int(basis.get("telemetry_revision") or 0)
+        if revision > basis_revision:
+            invalidated.append((item, basis_revision))
+    return invalidated
+
+
 class RuleEngine:
-    ALIASES = {
-        "stations": "station", "assets": "asset", "links": "link", "telemetries": "telemetry",
+    ALIASES = {        "stations": "station", "assets": "asset", "links": "link", "telemetries": "telemetry",
         "incidents": "incident", "recovery_actions": "recovery_action", "missions": "mission",
         "gaps": "gap",
     }
@@ -178,7 +224,8 @@ class RuleEngine:
             "start_recovery": (("recovery_planned",), "recovering"),
             "resolve": (("recovering",), "resolved"),
             "close": (("resolved",), "closed"),
-            "reopen": (("resolved", "closed"), "open"),
+            "confirm_closure": (("reconfirm",), "resolved"),
+            "reopen": (("resolved", "closed", "reconfirm"), "open"),
         },
         "recovery_action": {
             "approve": (("proposed",), "approved"),
@@ -217,6 +264,7 @@ class RuleEngine:
         ("mission", "complete"): ("report",),
         ("gap", "fill"): ("estimate",),
         ("incident", "resolve"): ("summary",),
+        ("incident", "confirm_closure"): ("summary",),
     }
     CREATE_ROLES = {
         "station": ("admin", "engineer"),
@@ -246,6 +294,7 @@ class RuleEngine:
         "start_recovery": ("admin", "operator", "engineer"),
         "resolve": ("admin", "engineer"),
         "close": ("admin", "engineer"),
+        "confirm_closure": ("admin", "engineer"),
         "reopen": ("admin", "engineer", "operator"),
         "approve": ("admin", "engineer"),
         "start": ("admin", "engineer", "operator"),
@@ -268,6 +317,7 @@ class RuleEngine:
     CUSTOM_TRANSITIONS = {
         ("telemetry", "revise"): _revise_telemetry,
         ("incident", "resolve"): _resolve_incident,
+        ("incident", "confirm_closure"): _resolve_incident,
         ("recovery_action", "succeed"): _complete_action,
         ("mission", "complete"): _complete_mission,
     }
